@@ -1,9 +1,9 @@
 diff --git a/src/client/coach/Coach.ts b/src/client/coach/Coach.ts
 new file mode 100644
-index 0000000..980d127
+index 000000000..857fff422
 --- /dev/null
 +++ b/src/client/coach/Coach.ts
-@@ -0,0 +1,1002 @@
+@@ -0,0 +1,1010 @@
 +/**
 + * OpenFront Coach — local, singleplayer-only training aid.
 + *
@@ -610,6 +610,10 @@ index 0000000..980d127
 +        p.smallID,
 +      );
 +    }
++    // Allies due a renewal this tick. While any are pending, hold back all
++    // "break an alliance" advice: a lapsed alliance plus a fresh betrayal is
++    // two new fronts at once (Africa, 6:40 — Libya lapsed during a break).
++    const renewing: string[] = [];
 +    for (const p of s.players) {
 +      if (
 +        p.allianceExpiresInS !== null &&
@@ -624,12 +628,13 @@ index 0000000..980d127
 +          p.troops > me.troops * 0.8 ||
 +          !weak ||
 +          (top5.has(p.name) && p.troops > me.troops * 0.5);
++        if (renew) renewing.push(p.name);
 +        add(
 +          "alert",
 +          `ally:${p.name}`,
 +          `Alliance with ${p.name} ends in ${p.allianceExpiresInS}s — ${
 +            renew
-+              ? `RENEW (they have ${fmt(p.troops)} vs your ${fmt(me.troops)}).`
++              ? `RENEW (they have ${fmt(p.troops)} vs your ${fmt(me.troops)}) — before any other alliance move.`
 +              : `IGNORE, then attack (${fmt(me.troops)} vs ${fmt(p.troops)}).`
 +          }`,
 +          p.smallID,
@@ -691,15 +696,17 @@ index 0000000..980d127
 +          "stall",
 +          `Stalled — ${gained >= 0 ? `only +${gained.toFixed(1)}%` : `lost ${(-gained).toFixed(1)}%`} land in the last minute. ${
 +            allyWall
-+              ? me.troops >= allyWall.troops * breakX &&
-+                (allyWall.allianceExpiresInS === null ||
-+                  allyWall.allianceExpiresInS > 60)
-+                ? `${allyWall.name} (ally, ${fmt(allyWall.troops)}) is in the way and you're ${Math.round(me.troops / Math.max(1, allyWall.troops))}× stronger — break the alliance now and take them.`
-+                : `${allyWall.name} (ally, ${fmt(allyWall.troops)}) is a third your size and in the way — let the alliance lapse${
-+                    allyWall.allianceExpiresInS !== null
-+                      ? ` (${allyWall.allianceExpiresInS}s)`
-+                      : ""
-+                  } and take them.`
++              ? renewing.length
++                ? `${allyWall.name} (ally, ${fmt(allyWall.troops)}) is in the way — renew ${renewing.join(" and ")} first, then deal with them.`
++                : me.troops >= allyWall.troops * breakX &&
++                    (allyWall.allianceExpiresInS === null ||
++                      allyWall.allianceExpiresInS > 60)
++                  ? `${allyWall.name} (ally, ${fmt(allyWall.troops)}) is in the way and you're ${Math.round(me.troops / Math.max(1, allyWall.troops))}× stronger — break the alliance now and take them.`
++                  : `${allyWall.name} (ally, ${fmt(allyWall.troops)}) is a third your size and in the way — let the alliance lapse${
++                      allyWall.allianceExpiresInS !== null
++                        ? ` (${allyWall.allianceExpiresInS}s)`
++                        : ""
++                    } and take them.`
 +              : enemies.length
 +                ? "Raise the slider and hit your weakest neighbour."
 +                : "Boat to a non-ally."
@@ -839,6 +846,7 @@ index 0000000..980d127
 +      const x = me.troops / Math.max(1, weakestAlly.troops);
 +      if (
 +        x >= breakX &&
++        !renewing.length &&
 +        (weakestAlly.allianceExpiresInS === null ||
 +          weakestAlly.allianceExpiresInS > 60)
 +      ) {
@@ -1007,7 +1015,7 @@ index 0000000..980d127
 +  }
 +}
 diff --git a/src/client/hud/GameRenderer.ts b/src/client/hud/GameRenderer.ts
-index 02de644..52125bb 100644
+index 02de64497..52125bbed 100644
 --- a/src/client/hud/GameRenderer.ts
 +++ b/src/client/hud/GameRenderer.ts
 @@ -10,6 +10,7 @@ import { MapLayerController } from "../controllers/MapLayerController";
