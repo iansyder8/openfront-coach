@@ -42,13 +42,15 @@ nuke alerts · boats · landattack · slider-danger · weak / weak-cancel (CANCE
 feeding one target, persists across relaunches) · war:<name> (bigger neighbour attacking) ·
 siege (under attack with gold banked → posts, SAM, cities) · ally:<name> renew/ignore
 (neighbouring ally ≤⅓ your size → IGNORE; any pending RENEW suppresses breaknow and stall's "break now"; nukeRisk = ally has silos and you have
-< 1 SAM per 3 cities → always RENEW, no breaknow, stall says "get N more SAMs first") · mirv:<name> (can afford NOW) · mirvsoon (neighbours/top-5
+< 1 SAM per 3 cities → always RENEW, no breaknow, stall says "get N more SAMs first"; only ONE ally gets IGNORE at a time (the weakest),
+none while attacks or boats are incoming; boxed is hidden for an ally being renewed) · mirv:<name> (can afford NOW) · mirvsoon (neighbours/top-5
 only, once per nation for 60s) · empty · idle (≥80% cap, no attack) · stall (land barely moving for 60s;
 names ally in the way; "break now" at ≥3× before 8:00, ≥5× after) · idlegold · city · sam-now (red:
 no SAM, affordable, silo neighbour) / sam / sam-more (below 1 SAM per 3 cities, affordable) · port · ask:<nation> (before 3:00) · target (never a bigger
 nation attacking you) · slider-full · slider (only if ≤60% really sends 1.6× and target < your troops) ·
 wild · breaknow / boxed · slider-low · bigally · mirvme (25M + SAM cover → MIRV the rival with most cities) · hbomb (only when ≥30% troops and nothing incoming).
-idlegold fires at max(3M, 3× city cost).
+idlegold fires at max(3M, 3× city cost); before 5:00 just 3× city cost.
+On elimination (tiles 0 after spawn) the coach freezes: one "Eliminated" tip, history stops.
 `tiny()` hides leftovers (<0.3% land or <3% of your tiles after 3:00).
 
 ## Ian's recurring mistakes (check every log)
@@ -73,3 +75,8 @@ Africa 13:40 (log mid-game): stalled 3:00–5:30 (ignored BREAK Egypt), fed Syri
 CANCELs, reached #1 at 11:30 with 556K troops, then coach said IGNORE Sudan (2 silos) with 1 SAM over 7 cities
 → three atom bombs, slider 62% into Sudan, 478K→4K troops in 70s, 9→7 cities, SAM lost, 5.3M unspent.
 Coach fixed: nukeRisk guard.
+Africa eliminated 38:40: 780K banked at 2:30 (first city 2:50); coach said IGNORE Senegal, Mali and Morocco at
+5:00 while boats landed → Benin/Nigeria/Morocco war; fed Morocco 150s (10:18–12:50) through CANCELs; #1 at 15:10
+(11% land) then Libya + CAR nukes 15:20–17:50 (9→5 cities, 1–2 SAMs); attacked Nigeria at 20:00 → H-bomb, 7→2
+cities; collapsed to 1% at 22:10 with 4.9M unspent, then sat 15 min at 0.6% land, 100% troops, slider 100%, never
+attacking. Coach fixed: one IGNORE at a time, early idlegold, freeze on death.
