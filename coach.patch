@@ -1,0 +1,1028 @@
+diff --git a/src/client/coach/Coach.ts b/src/client/coach/Coach.ts
+new file mode 100644
+index 0000000..980d127
+--- /dev/null
++++ b/src/client/coach/Coach.ts
+@@ -0,0 +1,1002 @@
++/**
++ * OpenFront Coach — local, singleplayer-only training aid.
++ *
++ * Reads the client-side GameView every 500 ms and:
++ *  1. publishes a full-map snapshot on `window.__coach` (for Claude / devtools),
++ *  2. keeps a rolling history on `window.__coachLog` (for post-game review),
++ *  3. renders an on-screen panel with alerts and "do next" advice built from
++ *     the OpenFront Playbook rules.
++ *
++ * It only reads state; it never sends intents or plays for you.
++ */
++import { EventBus } from "../../core/EventBus";
++import { GameType, PlayerType, UnitType } from "../../core/game/Game";
++import { TileRef } from "../../core/game/GameMap";
++import { Controller } from "../Controller";
++import { GoToPlayerEvent } from "../TransformHandler";
++import { UIState } from "../UIState";
++import { GameView, PlayerView } from "../view";
++
++type Level = "alert" | "do" | "info";
++interface Tip {
++  level: Level;
++  key: string;
++  text: string;
++  /** smallID of the player the tip is about — click to jump there */
++  sid?: number;
++}
++
++interface PlayerSnap {
++  name: string;
++  smallID: number;
++  type: string;
++  landPct: number;
++  tiles: number;
++  troops: number;
++  maxTroops: number;
++  gold: number;
++  cities: number;
++  silos: number;
++  sams: number;
++  defensePosts: number;
++  allied: boolean;
++  allianceExpiresInS: number | null;
++  neighbor: boolean;
++  isTraitor: boolean;
++}
++
++const TICKS_PER_S = 10;
++/** Internal troop units are 10x what the HUD shows; convert to HUD units. */
++const hud = (n: number) => Math.round(n / 10);
++const BUILD_TYPES = [
++  UnitType.City,
++  UnitType.Port,
++  UnitType.Factory,
++  UnitType.DefensePost,
++  UnitType.SAMLauncher,
++  UnitType.MissileSilo,
++  UnitType.Warship,
++] as const;
++
++function pow2(n: number) {
++  return Math.pow(2, n);
++}
++
++/** Mirrors DefaultConfig.unitInfo costs (read-only estimate for advice). */
++function nextCost(
++  type: UnitType,
++  counts: Record<string, number>,
++  mirvsLaunched: number,
++): number {
++  const n = (t: UnitType) => counts[t] ?? 0;
++  switch (type) {
++    case UnitType.City:
++      return Math.min(1_000_000, pow2(n(UnitType.City)) * 125_000);
++    case UnitType.Port:
++    case UnitType.Factory:
++      return Math.min(
++        1_000_000,
++        pow2(n(UnitType.Port) + n(UnitType.Factory)) * 125_000,
++      );
++    case UnitType.DefensePost:
++      return Math.min(250_000, (n(UnitType.DefensePost) + 1) * 50_000);
++    case UnitType.SAMLauncher:
++      return Math.min(3_000_000, (n(UnitType.SAMLauncher) + 1) * 1_500_000);
++    case UnitType.MissileSilo:
++      return 1_000_000;
++    case UnitType.Warship:
++      return Math.min(1_000_000, (n(UnitType.Warship) + 1) * 250_000);
++    case UnitType.AtomBomb:
++      return 750_000;
++    case UnitType.HydrogenBomb:
++      return 5_000_000;
++    case UnitType.MIRV:
++      return 25_000_000 + mirvsLaunched * 15_000_000;
++    default:
++      return 0;
++  }
++}
++
++export function fmt(n: number): string {
++  const a = Math.abs(n);
++  if (a >= 1e6) return (n / 1e6).toFixed(a >= 1e7 ? 1 : 2) + "M";
++  if (a >= 1e3) return (n / 1e3).toFixed(a >= 1e5 ? 0 : 1) + "K";
++  return Math.round(n).toString();
++}
++
++function esc(s: string): string {
++  return s.replace(
++    /[&<>"']/g,
++    (c) =>
++      ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" })[
++        c
++      ]!,
++  );
++}
++
++export class CoachController implements Controller {
++  private panel: HTMLDivElement | null = null;
++  private collapsed = false;
++  private neighborIDs = new Set<number>();
++  private wildernessNeighbor = false;
++  private coastal = false;
++  private lastBorderScanMs = 0;
++  private borderScanInFlight = false;
++  private lastGold: { t: number; gold: number } | null = null;
++  private goldPerS = 0;
++  private lastHistoryS = -999;
++  private history: unknown[] = [];
++  private weakSince = new Map<string, { since: number; seen: number }>();
++  private mirvSoonFirst = new Map<string, number>();
++  private alertLog: { t: number; text: string }[] = [];
++  private activeAlertKeys = new Set<string>();
++  private mirvsSeen = new Set<number>();
++
++  constructor(
++    private game: GameView,
++    private eventBus: EventBus,
++    private uiState: UIState,
++  ) {}
++
++  getTickIntervalMs() {
++    return 500;
++  }
++
++  private enabled = false;
++
++  init() {
++    // Fair play: only ever active in singleplayer games.
++    this.enabled =
++      this.game.config().gameConfig().gameType === GameType.Singleplayer;
++    if (!this.enabled) return;
++    const el = document.createElement("div");
++    el.id = "openfront-coach";
++    el.style.cssText = [
++      "position:fixed",
++      "right:8px",
++      "top:52px",
++      "width:300px",
++      "max-height:calc(100vh - 260px)",
++      "overflow:auto",
++      "z-index:900",
++      "background:rgba(15,20,28,0.88)",
++      "color:#e8edf2",
++      "font:12px/1.35 system-ui,-apple-system,sans-serif",
++      "border:1px solid rgba(255,255,255,0.15)",
++      "border-radius:8px",
++      "padding:8px 10px",
++      "box-shadow:0 4px 16px rgba(0,0,0,0.4)",
++      "pointer-events:auto",
++    ].join(";");
++    el.addEventListener("pointerdown", (e) => {
++      const t = (e.target as HTMLElement).closest<HTMLElement>("[data-coach]");
++      if (!t) return;
++      if (t.dataset.coach === "goto") {
++        const sid = Number(t.dataset.sid);
++        const p = this.game.playerBySmallID(sid);
++        if (p.isPlayer())
++          this.eventBus.emit(new GoToPlayerEvent(p as PlayerView));
++      } else if (t.dataset.coach === "toggle") {
++        this.collapsed = !this.collapsed;
++        this.render(this.lastSnap);
++      } else if (t.dataset.coach === "copy") {
++        const text = JSON.stringify(
++          {
++            final: this.lastSnap,
++            history: this.history,
++            alerts: this.alertLog,
++          },
++          null,
++          1,
++        );
++        void navigator.clipboard?.writeText(text);
++        t.textContent = "copied";
++      }
++    });
++    // keep map from receiving clicks/wheel through the panel
++    for (const ev of ["mousedown", "wheel", "pointerdown", "contextmenu"]) {
++      el.addEventListener(ev, (e) => e.stopPropagation());
++    }
++    document.body.appendChild(el);
++    this.panel = el;
++    (window as any).__coachLog = this.history;
++    // Compact view for Claude: me, advice, neighbours, top rivals.
++    (window as any).__coachBrief = () => {
++      const s = this.lastSnap;
++      if (!s) return null;
++      return {
++        t: s.t,
++        winPct: s.winPct,
++        me: s.me,
++        tips: s.tips,
++        neighbours: s.players.filter((p: PlayerSnap) => p.neighbor),
++        rivals: s.players
++          .filter((p: PlayerSnap) => p.type !== PlayerType.Bot)
++          .slice(0, 8),
++        recentAlerts: this.alertLog.slice(-10),
++      };
++    };
++    (window as any).__coachAlerts = this.alertLog;
++  }
++
++  private lastSnap: any = null;
++
++  tick() {
++    if (!this.enabled) return;
++    const me = this.game.myPlayer();
++    if (!me) return;
++    try {
++      this.maybeScanBorders(me);
++      const snap = this.snapshot(me);
++      snap.tips = this.advise(snap);
++      this.logAlerts(snap);
++      this.lastSnap = snap;
++      (window as any).__coach = snap;
++      if (snap.t - this.lastHistoryS >= 10) {
++        this.lastHistoryS = snap.t;
++        this.history.push({
++          t: snap.t,
++          rank: snap.me.rank,
++          landPct: snap.me.landPct,
++          troops: snap.me.troops,
++          maxTroops: snap.me.maxTroops,
++          gold: snap.me.gold,
++          cities: snap.me.units[UnitType.City] ?? 0,
++          sams: snap.me.units[UnitType.SAMLauncher] ?? 0,
++          silos: snap.me.units[UnitType.MissileSilo] ?? 0,
++          nukesIncoming: snap.me.nukesIncoming.length,
++          topRival: snap.players.find(
++            (p: PlayerSnap) => p.type !== PlayerType.Bot,
++          )?.name,
++          attackRatio: snap.me.attackRatio,
++          outgoing: snap.me.outgoing.length,
++          tips: snap.tips.map((t: Tip) => t.text),
++        });
++      }
++      this.render(snap);
++    } catch (e) {
++      console.warn("[coach]", e);
++    }
++  }
++
++  // ---------- data ----------
++
++  private maybeScanBorders(me: PlayerView) {
++    const now = performance.now();
++    if (this.borderScanInFlight || now - this.lastBorderScanMs < 2000) return;
++    if (!me.isAlive() || me.numTilesOwned() === 0) return;
++    this.borderScanInFlight = true;
++    this.lastBorderScanMs = now;
++    me.borderTiles()
++      .then(({ borderTiles }) => {
++        const ids = new Set<number>();
++        let wild = false;
++        let coast = false;
++        const mySid = me.smallID();
++        borderTiles.forEach((t: TileRef) => {
++          this.game.forEachNeighbor(t, (n) => {
++            if (this.game.isWater(n)) {
++              if (this.game.isOcean(n)) coast = true;
++              return;
++            }
++            const o = this.game.ownerID(n);
++            if (o === mySid) return;
++            if (o === 0) wild = true;
++            else ids.add(o);
++          });
++        });
++        this.neighborIDs = ids;
++        this.wildernessNeighbor = wild;
++        this.coastal = coast;
++      })
++      .catch(() => {})
++      .finally(() => {
++        this.borderScanInFlight = false;
++      });
++  }
++
++  private snapshot(me: PlayerView) {
++    const g = this.game;
++    const cfg = g.config();
++    const tick = g.ticks();
++    const t = Math.round(g.elapsedGameSeconds());
++    const validLand = Math.max(1, g.numLandTiles() - g.numTilesWithFallout());
++    const alive = g.playerViews().filter((p) => p.isAlive());
++    const ranked = [...alive].sort(
++      (a, b) => b.numTilesOwned() - a.numTilesOwned(),
++    );
++    const allianceMap = new Map<string, number>();
++    for (const a of me.alliances()) {
++      allianceMap.set(String(a.other), (a.expiresAt - tick) / TICKS_PER_S);
++    }
++
++    const counts: Record<string, number> = {};
++    const cityLevels = me
++      .units(UnitType.City)
++      .reduce((s, u) => s + u.level(), 0);
++    for (const type of BUILD_TYPES) counts[type] = me.units(type).length;
++
++    const mirvsLaunched = this.countMirvs();
++    const costs: Record<string, number> = {};
++    for (const type of [
++      ...BUILD_TYPES,
++      UnitType.AtomBomb,
++      UnitType.HydrogenBomb,
++      UnitType.MIRV,
++    ]) {
++      costs[type] = nextCost(type, counts, mirvsLaunched);
++    }
++
++    const gold = Number(me.gold());
++    const nowMs = performance.now();
++    if (this.lastGold && nowMs - this.lastGold.t > 4000) {
++      const dt = (nowMs - this.lastGold.t) / 1000;
++      this.goldPerS = Math.max(0, (gold - this.lastGold.gold) / dt);
++      this.lastGold = { t: nowMs, gold };
++    }
++    this.lastGold ??= { t: nowMs, gold };
++
++    let ratio = this.uiState.attackRatio;
++    if (ratio > 1) ratio = ratio / 100;
++
++    const troops = me.troops() / 10;
++    const maxTroops = cfg.maxTroops(me) / 10;
++    const growth = (cfg.troopIncreaseRate(me) * TICKS_PER_S) / 10;
++
++    const playerSnap = (p: PlayerView): PlayerSnap => {
++      const exp = allianceMap.get(String(p.id()));
++      return {
++        name: p.displayName(),
++        smallID: p.smallID(),
++        type: p.type(),
++        landPct: +((p.numTilesOwned() / validLand) * 100).toFixed(2),
++        tiles: p.numTilesOwned(),
++        troops: hud(p.troops()),
++        maxTroops: hud(cfg.maxTroops(p)),
++        gold: Number(p.gold()),
++        cities: p.units(UnitType.City).length,
++        silos: p.units(UnitType.MissileSilo).length,
++        sams: p.units(UnitType.SAMLauncher).length,
++        defensePosts: p.units(UnitType.DefensePost).length,
++        allied: me.isFriendly(p),
++        allianceExpiresInS: exp !== undefined ? Math.round(exp) : null,
++        neighbor: this.neighborIDs.has(p.smallID()),
++        isTraitor: p.isTraitor(),
++      };
++    };
++
++    const nameOf = (sid: number) => {
++      const p = g.playerBySmallID(sid);
++      return p.isPlayer() ? (p as PlayerView).displayName() : "?";
++    };
++
++    // threats: enemy boats & nukes heading to my land
++    const mySid = me.smallID();
++    const boats: { from: string; troops: number }[] = [];
++    const nukes: { from: string; type: string }[] = [];
++    for (const u of g.units(
++      UnitType.TransportShip,
++      UnitType.AtomBomb,
++      UnitType.HydrogenBomb,
++      UnitType.MIRV,
++      UnitType.MIRVWarhead,
++    )) {
++      if (!u.isActive() || u.owner().smallID() === mySid) continue;
++      const tt = u.targetTile();
++      if (tt === undefined || g.ownerID(tt) !== mySid) continue;
++      if (u.type() === UnitType.TransportShip) {
++        if (!u.transportShipState().isRetreating)
++          boats.push({
++            from: u.owner().displayName(),
++            troops: hud(u.troops()),
++          });
++      } else {
++        nukes.push({ from: u.owner().displayName(), type: u.type() });
++      }
++    }
++
++    return {
++      version: 1,
++      t,
++      tick,
++      inSpawnPhase: g.inSpawnPhase(),
++      gameOver: g.gameOver(),
++      winPct: cfg.percentageTilesOwnedToWin(g.elapsedGameSeconds()),
++      me: {
++        name: me.displayName(),
++        rank: ranked.indexOf(me) + 1,
++        players: ranked.length,
++        landPct: +((me.numTilesOwned() / validLand) * 100).toFixed(2),
++        tiles: me.numTilesOwned(),
++        troops: Math.round(troops),
++        maxTroops: Math.round(maxTroops),
++        troopPct: +(troops / Math.max(1, maxTroops)).toFixed(3),
++        growthPerS: Math.round(growth),
++        gold,
++        goldPerS: Math.round(this.goldPerS),
++        attackRatio: +ratio.toFixed(2),
++        sendTroops: Math.round(troops * ratio),
++        units: counts,
++        cityLevels,
++        nextCost: costs,
++        coastal: this.coastal,
++        wildernessNeighbor: this.wildernessNeighbor,
++        isTraitor: me.isTraitor(),
++        incoming: me
++          .incomingAttacks()
++          .filter((a) => !a.retreating)
++          .map((a) => ({ from: nameOf(a.attackerID), troops: hud(a.troops) })),
++        outgoing: me
++          .outgoingAttacks()
++          .filter((a) => !a.retreating)
++          .map((a) => {
++            const tp = a.targetID ? g.playerBySmallID(a.targetID) : null;
++            const target = tp && tp.isPlayer() ? (tp as PlayerView) : null;
++            return {
++              to: target ? target.displayName() : "Wilderness",
++              troops: hud(a.troops),
++              defenderTroops: target ? hud(target.troops()) : 0,
++            };
++          }),
++        boatsIncoming: boats,
++        nukesIncoming: nukes,
++      },
++      players: ranked.filter((p) => p !== me).map(playerSnap),
++      tips: [] as Tip[],
++    };
++  }
++
++  private countMirvs(): number {
++    for (const u of this.game.units(UnitType.MIRV)) this.mirvsSeen.add(u.id());
++    return this.mirvsSeen.size;
++  }
++
++  // ---------- rules (OpenFront Playbook) ----------
++
++  private advise(s: ReturnType<CoachController["snapshot"]>): Tip[] {
++    const tips: Tip[] = [];
++    const me = s.me;
++    const add = (level: Level, key: string, text: string, sid?: number) =>
++      tips.push({ level, key, text, sid });
++    // After the opening, ignore leftover scraps not worth chasing.
++    // Early on, idle minutes cost more than the traitor penalty.
++    const breakX = s.t < 480 ? 3 : 5;
++    const tiny = (p: PlayerSnap) =>
++      s.t >= 180 && (p.landPct < 0.3 || p.tiles < me.tiles * 0.03);
++
++    if (s.inSpawnPhase) {
++      add(
++        "do",
++        "spawn",
++        "Spawn on plains with coast behind you, only grey tribe dots nearby, far from other players.",
++      );
++      return tips;
++    }
++    if (s.gameOver) return tips;
++
++    const neighbors = s.players.filter((p) => p.neighbor && !tiny(p));
++    const enemies = neighbors.filter((p) => !p.allied);
++    const top5 = new Set(s.players.slice(0, 5).map((p) => p.name));
++
++    // --- alerts ---
++    const nukeGroups = new Map<
++      string,
++      { from: string; type: string; n: number }
++    >();
++    for (const n of me.nukesIncoming) {
++      const type = n.type === UnitType.MIRVWarhead ? UnitType.MIRV : n.type;
++      const k = `${n.from}|${type}`;
++      const g = nukeGroups.get(k) ?? { from: n.from, type, n: 0 };
++      g.n++;
++      nukeGroups.set(k, g);
++    }
++    for (const g of nukeGroups.values()) {
++      add(
++        "alert",
++        `nuke:${g.from}:${g.type}`,
++        `${g.type}${g.n > 1 ? ` (${g.n} warheads)` : ""} inbound from ${g.from}. ${
++          (me.units[UnitType.SAMLauncher] ?? 0) === 0
++            ? "You have no SAM — buy one (" +
++              fmt(me.nextCost[UnitType.SAMLauncher]) +
++              ") over your cities."
++            : "SAMs may catch some; keep troops out of the blast area, then rebuild cities and hit back."
++        }`,
++      );
++    }
++    const boatTroops = me.boatsIncoming.reduce((a, b) => a + b.troops, 0);
++    if (boatTroops > Math.max(1000, me.troops * 0.02)) {
++      const home = me.troops;
++      add(
++        "alert",
++        "boats",
++        `Naval invasion: ${fmt(boatTroops)} from ${[
++          ...new Set(me.boatsIncoming.map((b) => b.from)),
++        ].join(", ")}. Home ${fmt(home)}. ${
++          home < boatTroops * 1.5
++            ? "Don't launch new attacks; defence post at the landing."
++            : "You can hold it — counter the beachhead once it lands."
++        }`,
++      );
++    }
++    const incoming = me.incoming.reduce((a, b) => a + b.troops, 0);
++    if (incoming > me.troops * 0.5) {
++      add(
++        "alert",
++        "landattack",
++        `Being attacked by ${fmt(incoming)} (${me.incoming
++          .map((i) => i.from)
++          .join(", ")}) vs ${fmt(me.troops)} home. Defence post (${fmt(
++          me.nextCost[UnitType.DefensePost],
++        )}) on that front; cut other attacks.`,
++      );
++    }
++    const postCost = me.nextCost[UnitType.DefensePost];
++    const threat = incoming + boatTroops;
++    if (
++      threat > me.troops * 0.25 &&
++      me.gold >= Math.max(1_000_000, postCost * 2)
++    ) {
++      const fronts = [
++        ...new Set([
++          ...me.incoming.map((i) => i.from),
++          ...me.boatsIncoming.map((b) => b.from),
++        ]),
++      ];
++      const siloFoe = s.players.some(
++        (p) => fronts.includes(p.name) && p.silos > 0,
++      );
++      const mySamsNow = me.units[UnitType.SAMLauncher] ?? 0;
++      add(
++        "alert",
++        "siege",
++        `Under attack (${fmt(threat)} from ${fronts.join(", ")}) with ${fmt(me.gold)} banked — spend it now: defence posts on that front (${fmt(postCost)} each)${
++          siloFoe && mySamsNow < 3
++            ? `, a SAM (${fmt(me.nextCost[UnitType.SAMLauncher])})`
++            : ""
++        }, then cities (${fmt(me.nextCost[UnitType.City])}). Keep troops home.`,
++      );
++    }
++    if ((incoming > 0 || boatTroops > 0) && me.attackRatio > 0.6) {
++      add(
++        "alert",
++        "slider-danger",
++        `Slider at ${Math.round(me.attackRatio * 100)}% while under attack — drop to ~35%.`,
++      );
++    }
++    const weakNow = new Set<string>();
++    for (const o of me.outgoing) {
++      if (o.to !== "Wilderness" && o.troops < o.defenderTroops * 0.8) {
++        weakNow.add(o.to);
++        // Keep counting across relaunches on the same target.
++        const w = this.weakSince.get(o.to) ?? { since: s.t, seen: s.t };
++        w.seen = s.t;
++        this.weakSince.set(o.to, w);
++        const age = s.t - w.since;
++        add(
++          "alert",
++          age >= 30 ? `weak-cancel:${o.to}` : `weak:${o.to}`,
++          age >= 30
++            ? `CANCEL your attack on ${o.to} — ${Math.round(age)}s of feeding ${fmt(o.troops)} into ${fmt(
++                o.defenderTroops,
++              )}. Put defence posts on that border instead.`
++            : `Attack on ${o.to} is underpowered (${fmt(o.troops)} vs ${fmt(
++                o.defenderTroops,
++              )}). Top it up or cancel.`,
++        );
++      }
++    }
++    for (const [k, w] of [...this.weakSince])
++      if (!weakNow.has(k) && s.t - w.seen > 60) this.weakSince.delete(k);
++
++    // War mode: a bigger neighbour is attacking you.
++    const attackers = new Map<string, number>();
++    for (const i of me.incoming)
++      attackers.set(i.from, (attackers.get(i.from) ?? 0) + i.troops);
++    for (const [name, sent] of attackers) {
++      const p = s.players.find((x) => x.name === name);
++      if (!p || p.troops < me.troops || sent < me.troops * 0.2) continue;
++      add(
++        "alert",
++        `war:${name}`,
++        `WAR — ${name} (${fmt(p.troops)}) is bigger than you (${fmt(me.troops)}). Don't attack them back. Cancel attacks into them, defence posts on that border${
++          p.silos > 0 ? ", a SAM over your cities (they have silos)" : ""
++        }, and keep building cities.`,
++        p.smallID,
++      );
++    }
++    for (const p of s.players) {
++      if (
++        p.allianceExpiresInS !== null &&
++        p.allianceExpiresInS <= 30 &&
++        !tiny(p)
++      ) {
++        // A neighbouring ally a third your size is blocking land you need.
++        // Non-neighbours aren't in the way, so keeping them costs nothing.
++        const weak = me.sendTroops > p.troops * 1.5 || me.troops > p.troops * 3;
++        const renew =
++          !p.neighbor ||
++          p.troops > me.troops * 0.8 ||
++          !weak ||
++          (top5.has(p.name) && p.troops > me.troops * 0.5);
++        add(
++          "alert",
++          `ally:${p.name}`,
++          `Alliance with ${p.name} ends in ${p.allianceExpiresInS}s — ${
++            renew
++              ? `RENEW (they have ${fmt(p.troops)} vs your ${fmt(me.troops)}).`
++              : `IGNORE, then attack (${fmt(me.troops)} vs ${fmt(p.troops)}).`
++          }`,
++          p.smallID,
++        );
++      }
++    }
++    const mirvCost = me.nextCost[UnitType.MIRV];
++    for (const p of s.players) {
++      if (p.silos === 0 || tiny(p)) continue;
++      if (p.gold >= mirvCost) {
++        add(
++          "alert",
++          `mirv:${p.name}`,
++          `${p.name}${p.allied ? " (ally!)" : ""} can afford a MIRV NOW (${fmt(p.gold)} gold, ${p.silos} silos). Bomb their silos or get SAMs over every city cluster immediately.`,
++        );
++      } else if (
++        p.gold >= mirvCost * 0.6 &&
++        p.landPct >= 3 &&
++        (p.neighbor || top5.has(p.name))
++      ) {
++        // Warn once per nation, for a minute — not every time their gold wobbles.
++        const first = this.mirvSoonFirst.get(p.name) ?? s.t;
++        this.mirvSoonFirst.set(p.name, first);
++        if (s.t - first <= 60)
++          add(
++            "alert",
++            `mirvsoon:${p.name}`,
++            `${p.name}${p.allied ? " (ally!)" : ""} is saving for a MIRV: ${fmt(p.gold)} of ${fmt(mirvCost)}. Add SAMs over your cities now — you have maybe a minute.`,
++          );
++      }
++    }
++    if (me.troopPct < 0.1 && me.outgoing.length > 0 && s.t > 30) {
++      add(
++        "alert",
++        "empty",
++        `Only ${fmt(me.troops)} troops left at home — stop sending attacks until you're back above ~30%.`,
++      );
++    }
++    if (me.troopPct >= 0.8 && me.outgoing.length === 0) {
++      add(
++        "alert",
++        "idle",
++        `Troops at ${Math.round(me.troopPct * 100)}% of cap and nothing attacking — growth has stalled. Attack or build.`,
++      );
++    }
++
++    // Stalled: land barely moving for a minute while troops are healthy.
++    const ago = ([...this.history] as { t: number; landPct: number }[])
++      .reverse()
++      .find((h) => h.t <= s.t - 60);
++    if (ago && s.t >= 180 && me.troopPct > 0.5 && me.landPct < s.winPct) {
++      const gained = me.landPct - ago.landPct;
++      if (gained < Math.min(1.5, Math.max(0.3, ago.landPct * 0.08))) {
++        const allyWall = neighbors
++          .filter((p) => p.allied && me.troops > p.troops * 3)
++          .sort((a, b) => a.troops - b.troops)[0];
++        add(
++          "alert",
++          "stall",
++          `Stalled — ${gained >= 0 ? `only +${gained.toFixed(1)}%` : `lost ${(-gained).toFixed(1)}%`} land in the last minute. ${
++            allyWall
++              ? me.troops >= allyWall.troops * breakX &&
++                (allyWall.allianceExpiresInS === null ||
++                  allyWall.allianceExpiresInS > 60)
++                ? `${allyWall.name} (ally, ${fmt(allyWall.troops)}) is in the way and you're ${Math.round(me.troops / Math.max(1, allyWall.troops))}× stronger — break the alliance now and take them.`
++                : `${allyWall.name} (ally, ${fmt(allyWall.troops)}) is a third your size and in the way — let the alliance lapse${
++                    allyWall.allianceExpiresInS !== null
++                      ? ` (${allyWall.allianceExpiresInS}s)`
++                      : ""
++                  } and take them.`
++              : enemies.length
++                ? "Raise the slider and hit your weakest neighbour."
++                : "Boat to a non-ally."
++          }`,
++          allyWall?.smallID,
++        );
++      }
++    }
++
++    // --- do next ---
++    const cityCost = me.nextCost[UnitType.City];
++    if (me.gold >= Math.max(5_000_000, cityCost * 5)) {
++      add(
++        "alert",
++        "idlegold",
++        `${fmt(me.gold)} gold sitting idle — that's ${Math.floor(me.gold / cityCost)} cities or ${Math.floor(me.gold / me.nextCost[UnitType.SAMLauncher])} SAMs. Spend it.`,
++      );
++    }
++    if (me.gold >= cityCost) {
++      add(
++        "do",
++        "city",
++        `Build a city now (${fmt(cityCost)}) — +25K troop cap.`,
++      );
++    }
++    const hostileSilos = s.players.some((p) => !p.allied && p.silos > 0);
++    const sams = me.units[UnitType.SAMLauncher] ?? 0;
++    const siloNeighbour = neighbors.find((p) => p.silos > 0);
++    const samCost = me.nextCost[UnitType.SAMLauncher];
++    if (
++      sams === 0 &&
++      siloNeighbour &&
++      me.gold >= samCost &&
++      (me.units[UnitType.City] ?? 0) >= 3
++    ) {
++      add(
++        "alert",
++        "sam-now",
++        `Buy your first SAM NOW (${fmt(samCost)}, affordable) — ${siloNeighbour.name}${
++          siloNeighbour.allied ? " (ally)" : ""
++        } borders you with ${siloNeighbour.silos} silo${siloNeighbour.silos > 1 ? "s" : ""}. One bomb costs you more than the SAM. Put it over your densest cities.`,
++        siloNeighbour.smallID,
++      );
++    } else if (
++      hostileSilos &&
++      sams === 0 &&
++      (me.units[UnitType.City] ?? 0) >= 3
++    ) {
++      add(
++        "do",
++        "sam",
++        `Enemies have silos — first SAM (${fmt(
++          me.nextCost[UnitType.SAMLauncher],
++        )}) over your densest cities${me.gold >= me.nextCost[UnitType.SAMLauncher] ? " — affordable now." : "."}`,
++      );
++    }
++    if (
++      me.coastal &&
++      (me.units[UnitType.Port] ?? 0) === 0 &&
++      (me.units[UnitType.City] ?? 0) >= 1 &&
++      me.gold >= me.nextCost[UnitType.Port]
++    ) {
++      add(
++        "do",
++        "port",
++        `Build a port (${fmt(me.nextCost[UnitType.Port])}) for trade income.`,
++      );
++    }
++
++    // early game: ally neighbouring nations, eat tribes
++    if (s.t < 180) {
++      for (const p of enemies.filter((p) => p.type === PlayerType.Nation)) {
++        add(
++          "do",
++          `ask:${p.name}`,
++          `Ask ${p.name} for an alliance now — AI acceptance drops after ~3 min.`,
++          p.smallID,
++        );
++      }
++    }
++
++    // best target
++    const atWarWith = new Set(me.incoming.map((i) => i.from));
++    const candidates = enemies
++      .filter((p) => s.t >= 180 || p.type !== PlayerType.Nation)
++      .filter((p) => !(atWarWith.has(p.name) && p.troops > me.troops * 0.7))
++      .filter((p) => p.troops > 0)
++      .map((p) => ({
++        p,
++        ratio: me.sendTroops / Math.max(1, p.troops),
++        big: top5.has(p.name) && p.troops > me.troops * 0.6,
++      }))
++      .sort((a, b) => a.p.troops - b.p.troops);
++    const good = candidates.find((c) => c.ratio >= 1.5 && !c.big);
++    const alreadyOn = new Set(me.outgoing.map((o) => o.to));
++    if (good && !alreadyOn.has(good.p.name)) {
++      add(
++        "do",
++        "target",
++        `Attack ${good.p.name} (${fmt(good.p.troops)}${
++          good.p.defensePosts ? ", has posts" : ""
++        }) — you'd send ${fmt(me.sendTroops)}, ${good.ratio.toFixed(1)}:1.`,
++        good.p.smallID,
++      );
++      if (me.troopPct >= 0.8 && me.attackRatio < 0.55) {
++        add(
++          "do",
++          "slider-full",
++          `Bar full — slider to 60–70% and hit ${good.p.name} hard (${fmt(me.troops * 0.65)} vs ${fmt(good.p.troops)}).`,
++          good.p.smallID,
++        );
++      }
++    } else if (candidates.length && !me.outgoing.length) {
++      const c = candidates[0];
++      // Only if 60% or less actually sends 1.6× their army.
++      const need =
++        Math.ceil(((c.p.troops * 1.6) / Math.max(1, me.troops)) * 20) / 20;
++      if (
++        !c.big &&
++        need <= 0.6 &&
++        need > me.attackRatio &&
++        c.p.troops < me.troops
++      ) {
++        add(
++          "do",
++          "slider",
++          `Raise slider to ${Math.round(need * 100)}% to hit ${c.p.name} (${fmt(c.p.troops)}).`,
++          c.p.smallID,
++        );
++      }
++    }
++    if (me.wildernessNeighbor && me.outgoing.length === 0 && !good) {
++      add("do", "wild", "Empty land next to you — expand into it.");
++    }
++    if (!enemies.length && neighbors.length && me.troopPct > 0.6) {
++      const weakestAlly = [...neighbors].sort((a, b) => a.troops - b.troops)[0];
++      const x = me.troops / Math.max(1, weakestAlly.troops);
++      if (
++        x >= breakX &&
++        (weakestAlly.allianceExpiresInS === null ||
++          weakestAlly.allianceExpiresInS > 60)
++      ) {
++        add(
++          "alert",
++          "breaknow",
++          `BREAK the alliance with ${weakestAlly.name} now — you're ${x.toFixed(0)}× stronger (${fmt(me.troops)} vs ${fmt(
++            weakestAlly.troops,
++          )}). The 30s traitor penalty won't matter; waiting ${
++            weakestAlly.allianceExpiresInS ?? "the"
++          }${weakestAlly.allianceExpiresInS !== null ? "s" : " timer"} will.`,
++          weakestAlly.smallID,
++        );
++      }
++      add(
++        "do",
++        "boxed",
++        `Boxed in by allies. Next victim: ${weakestAlly.name} (${fmt(
++          weakestAlly.troops,
++        )}) — let their alliance lapse${
++          weakestAlly.allianceExpiresInS !== null
++            ? ` (${weakestAlly.allianceExpiresInS}s)`
++            : ""
++        }, or boat to a non-ally.`,
++        weakestAlly.smallID,
++      );
++    }
++    if (
++      me.attackRatio < 0.25 &&
++      s.t < 300 &&
++      !tips.some((t) => t.key === "slider")
++    ) {
++      add("do", "slider-low", "Slider under 25% — early tribes need 30–35%.");
++    }
++
++    // --- info ---
++    for (const p of neighbors) {
++      if (p.allied && p.troops > me.troops * 2 && p.defensePosts >= 0) {
++        add(
++          "info",
++          `bigally:${p.name}`,
++          `${p.name} is allied but ${(p.troops / Math.max(1, me.troops)).toFixed(1)}× your troops — AI betrays weaker allies. Posts on that border.`,
++        );
++      }
++    }
++    const mySilos = me.units[UnitType.MissileSilo] ?? 0;
++    const myCities = me.units[UnitType.City] ?? 0;
++    const mirvTarget = s.players
++      .filter((p) => !p.allied && !tiny(p))
++      .sort((a, b) => b.cities - a.cities)[0];
++    if (
++      me.gold >= mirvCost &&
++      mirvTarget &&
++      sams >= Math.max(5, Math.ceil(myCities / 8))
++    ) {
++      add(
++        "alert",
++        "mirvme",
++        mySilos > 0
++          ? `${fmt(me.gold)} banked and your SAMs are up — MIRV ${mirvTarget.name} (${mirvTarget.cities} cities, ${fmt(mirvCost)}), then invade straight after.`
++          : `${fmt(me.gold)} banked — build a silo (1M) and MIRV ${mirvTarget.name} (${mirvTarget.cities} cities), then invade.`,
++        mirvTarget.smallID,
++      );
++    }
++    if (me.gold >= 5_000_000 && !tips.some((t) => t.key === "mirvme")) {
++      const rival = s.players.find((p) => !p.allied);
++      if (rival)
++        add(
++          "info",
++          "hbomb",
++          `Hydrogen bomb affordable (5M). Best use: ${rival.name}'s cities just before invading — outside their SAM circles.`,
++        );
++    }
++    return tips;
++  }
++
++  private logAlerts(s: any) {
++    const now = new Set<string>();
++    for (const tip of s.tips as Tip[]) {
++      if (tip.level !== "alert") continue;
++      if (!this.activeAlertKeys.has(tip.key) && !now.has(tip.key)) {
++        this.alertLog.push({ t: s.t, text: tip.text });
++        if (this.alertLog.length > 1000) this.alertLog.shift();
++      }
++      now.add(tip.key);
++    }
++    this.activeAlertKeys = now;
++  }
++
++  // ---------- panel ----------
++
++  private render(s: any) {
++    if (!this.panel || !s) return;
++    const me = s.me;
++    const zone =
++      me.troopPct >= 0.8
++        ? ["#ff6b6b", "wasting growth"]
++        : me.troopPct >= 0.55
++          ? ["#ffd166", "strong"]
++          : me.troopPct >= 0.3
++            ? ["#06d6a0", "peak growth"]
++            : ["#8ecae6", "rebuilding"];
++    const head = `<div style="display:flex;justify-content:space-between;align-items:center;gap:6px">
++      <b style="font-size:13px">Coach</b>
++      <span style="opacity:.8">#${me.rank}/${me.players} · ${me.landPct}% / ${s.winPct}%</span>
++      <span>
++        <button data-coach="copy" title="Copy game log for Claude" style="background:#334;color:#cde;border:0;border-radius:4px;padding:1px 6px;cursor:pointer">log</button>
++        <button data-coach="toggle" style="background:#334;color:#cde;border:0;border-radius:4px;padding:1px 6px;cursor:pointer">${this.collapsed ? "+" : "–"}</button>
++      </span></div>`;
++    if (this.collapsed) {
++      const a = (s.tips as Tip[]).filter((t) => t.level === "alert").length;
++      this.panel.innerHTML =
++        head +
++        (a
++          ? `<div style="color:#ff6b6b;margin-top:4px">${a} alert(s)</div>`
++          : "");
++      return;
++    }
++    const bar = `<div style="margin:6px 0 2px">Troops ${fmt(me.troops)} / ${fmt(me.maxTroops)} · +${fmt(me.growthPerS)}/s</div>
++      <div style="height:6px;background:#233;border-radius:3px;overflow:hidden"><div style="height:100%;width:${Math.min(100, me.troopPct * 100)}%;background:${zone[0]}"></div></div>
++      <div style="display:flex;justify-content:space-between;opacity:.85;margin-top:2px"><span style="color:${zone[0]}">${Math.round(me.troopPct * 100)}% · ${zone[1]}</span><span>slider ${Math.round(me.attackRatio * 100)}% = ${fmt(me.sendTroops)}</span></div>
++      <div style="margin-top:4px">Gold ${fmt(me.gold)} (+${fmt(me.goldPerS)}/s) · next city ${fmt(me.nextCost[UnitType.City])} · cities ${me.units[UnitType.City] ?? 0}</div>`;
++    const color = { alert: "#ff6b6b", do: "#ffd166", info: "#9fb3c8" };
++    const tips = (s.tips as Tip[])
++      .slice(0, 8)
++      .map(
++        (t) =>
++          `<div ${t.sid !== undefined ? `data-coach="goto" data-sid="${t.sid}" title="Go to them"` : ""} style="margin-top:5px;padding-left:6px;border-left:3px solid ${color[t.level]}${t.sid !== undefined ? ";cursor:pointer" : ""}">${esc(t.text)}${t.sid !== undefined ? ' <span style="opacity:.6">↗</span>' : ""}</div>`,
++      )
++      .join("");
++    const isTiny = (p: PlayerSnap) =>
++      s.t >= 180 && (p.landPct < 0.3 || p.tiles < me.tiles * 0.03);
++    const hiddenTiny = (s.players as PlayerSnap[]).filter(
++      (p) => p.neighbor && isTiny(p),
++    ).length;
++    const link = (p: PlayerSnap) =>
++      `<span data-coach="goto" data-sid="${p.smallID}" title="Go to ${esc(p.name)}" style="cursor:pointer;text-decoration:underline dotted">${esc(p.name)}</span>`;
++    const nb = (s.players as PlayerSnap[])
++      .filter((p) => p.neighbor && !isTiny(p))
++      .sort((a, b) => a.troops - b.troops)
++      .slice(0, 6)
++      .map((p) => {
++        const r = me.sendTroops / Math.max(1, p.troops);
++        const rc = r >= 1.5 ? "#06d6a0" : r >= 1 ? "#ffd166" : "#ff6b6b";
++        return `<tr><td>${link(p)}${p.type === PlayerType.Bot ? " <span style='opacity:.5'>tribe</span>" : ""}</td><td style="text-align:right">${fmt(p.troops)}</td><td style="text-align:right;color:${rc}">${r.toFixed(1)}:1</td><td style="text-align:right;opacity:.8">${p.allied ? "🤝" + (p.allianceExpiresInS ?? "") + "s" : ""}</td></tr>`;
++      })
++      .join("");
++    const rivals = (s.players as PlayerSnap[])
++      .filter((p) => p.type !== PlayerType.Bot)
++      .slice(0, 3)
++      .map(
++        (p) =>
++          `<div style="opacity:.85">${link(p)} ${p.landPct}% · ${fmt(p.troops)} · ${fmt(p.gold)}g${p.silos ? ` · ${p.silos} silo` : ""}${p.allied ? " 🤝" : ""}</div>`,
++      )
++      .join("");
++    this.panel.innerHTML =
++      head +
++      bar +
++      tips +
++      (nb
++        ? `<div style="margin-top:8px;font-weight:600">Neighbours (your send vs theirs)</div><table style="width:100%;border-collapse:collapse">${nb}</table>${hiddenTiny ? `<div style="opacity:.5;margin-top:2px">+${hiddenTiny} tiny leftovers hidden</div>` : ""}`
++        : "") +
++      (rivals
++        ? `<div style="margin-top:8px;font-weight:600">Top rivals</div>${rivals}`
++        : "");
++  }
++}
+diff --git a/src/client/hud/GameRenderer.ts b/src/client/hud/GameRenderer.ts
+index 02de644..52125bb 100644
+--- a/src/client/hud/GameRenderer.ts
++++ b/src/client/hud/GameRenderer.ts
+@@ -10,6 +10,7 @@ import { MapLayerController } from "../controllers/MapLayerController";
+ import { SoundEffectController } from "../controllers/SoundEffectController";
+ import { StructureHighlightController } from "../controllers/StructureHighlightController";
+ import { ViewModeController } from "../controllers/ViewModeController";
++import { CoachController } from "../coach/Coach";
+ import { WarshipSelectionController } from "../controllers/WarshipSelectionController";
+ import { GameStartingModal } from "../GameStartingModal";
+ import { migrateLegacyGraphicsSettings } from "../GraphicsPresets";
+@@ -363,6 +364,7 @@ export function createRenderer(
+     tutorialPanel,
+     alertFrame,
+     performanceOverlay,
++    new CoachController(game, eventBus, uiState),
+   ];
+ 
+   return new GameRenderer(
