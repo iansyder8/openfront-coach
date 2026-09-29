@@ -1,9 +1,9 @@
 diff --git a/src/client/coach/Coach.ts b/src/client/coach/Coach.ts
 new file mode 100644
-index 000000000..857fff422
+index 000000000..f914a8a77
 --- /dev/null
 +++ b/src/client/coach/Coach.ts
-@@ -0,0 +1,1010 @@
+@@ -0,0 +1,1044 @@
 +/**
 + * OpenFront Coach — local, singleplayer-only training aid.
 + *
@@ -483,6 +483,15 @@ index 000000000..857fff422
 +    const neighbors = s.players.filter((p) => p.neighbor && !tiny(p));
 +    const enemies = neighbors.filter((p) => !p.allied);
 +    const top5 = new Set(s.players.slice(0, 5).map((p) => p.name));
++    // Turning on a nation with silos is only safe under SAM cover — about one
++    // SAM per three cities (Africa 12:00: IGNOREd Sudan with 1 SAM over 7
++    // cities, took three atom bombs, lost the SAM and 2 cities).
++    const samCount = me.units[UnitType.SAMLauncher] ?? 0;
++    const samsNeeded = Math.max(
++      1,
++      Math.ceil((me.units[UnitType.City] ?? 0) / 3),
++    );
++    const nukeRisk = (p: PlayerSnap) => p.silos > 0 && samCount < samsNeeded;
 +
 +    // --- alerts ---
 +    const nukeGroups = new Map<
@@ -627,14 +636,19 @@ index 000000000..857fff422
 +          !p.neighbor ||
 +          p.troops > me.troops * 0.8 ||
 +          !weak ||
-+          (top5.has(p.name) && p.troops > me.troops * 0.5);
++          (top5.has(p.name) && p.troops > me.troops * 0.5) ||
++          nukeRisk(p);
 +        if (renew) renewing.push(p.name);
 +        add(
 +          "alert",
 +          `ally:${p.name}`,
 +          `Alliance with ${p.name} ends in ${p.allianceExpiresInS}s — ${
 +            renew
-+              ? `RENEW (they have ${fmt(p.troops)} vs your ${fmt(me.troops)}) — before any other alliance move.`
++              ? `RENEW (they have ${fmt(p.troops)} vs your ${fmt(me.troops)}${
++                  weak && p.neighbor && nukeRisk(p)
++                    ? `, but ${p.silos} silo${p.silos > 1 ? "s" : ""} vs your ${samCount} SAM${samCount === 1 ? "" : "s"} — get ${samsNeeded} SAMs before turning on them`
++                    : ""
++                }) — before any other alliance move.`
 +              : `IGNORE, then attack (${fmt(me.troops)} vs ${fmt(p.troops)}).`
 +          }`,
 +          p.smallID,
@@ -698,15 +712,17 @@ index 000000000..857fff422
 +            allyWall
 +              ? renewing.length
 +                ? `${allyWall.name} (ally, ${fmt(allyWall.troops)}) is in the way — renew ${renewing.join(" and ")} first, then deal with them.`
-+                : me.troops >= allyWall.troops * breakX &&
-+                    (allyWall.allianceExpiresInS === null ||
-+                      allyWall.allianceExpiresInS > 60)
-+                  ? `${allyWall.name} (ally, ${fmt(allyWall.troops)}) is in the way and you're ${Math.round(me.troops / Math.max(1, allyWall.troops))}× stronger — break the alliance now and take them.`
-+                  : `${allyWall.name} (ally, ${fmt(allyWall.troops)}) is a third your size and in the way — let the alliance lapse${
-+                      allyWall.allianceExpiresInS !== null
-+                        ? ` (${allyWall.allianceExpiresInS}s)`
-+                        : ""
-+                    } and take them.`
++                : nukeRisk(allyWall)
++                  ? `${allyWall.name} (ally, ${fmt(allyWall.troops)}) is in the way but has ${allyWall.silos} silo${allyWall.silos > 1 ? "s" : ""} — get ${samsNeeded - samCount} more SAM${samsNeeded - samCount > 1 ? "s" : ""} over your cities before you turn on them.`
++                  : me.troops >= allyWall.troops * breakX &&
++                      (allyWall.allianceExpiresInS === null ||
++                        allyWall.allianceExpiresInS > 60)
++                    ? `${allyWall.name} (ally, ${fmt(allyWall.troops)}) is in the way and you're ${Math.round(me.troops / Math.max(1, allyWall.troops))}× stronger — break the alliance now and take them.`
++                    : `${allyWall.name} (ally, ${fmt(allyWall.troops)}) is a third your size and in the way — let the alliance lapse${
++                        allyWall.allianceExpiresInS !== null
++                          ? ` (${allyWall.allianceExpiresInS}s)`
++                          : ""
++                      } and take them.`
 +              : enemies.length
 +                ? "Raise the slider and hit your weakest neighbour."
 +                : "Boat to a non-ally."
@@ -718,11 +734,11 @@ index 000000000..857fff422
 +
 +    // --- do next ---
 +    const cityCost = me.nextCost[UnitType.City];
-+    if (me.gold >= Math.max(5_000_000, cityCost * 5)) {
++    if (me.gold >= Math.max(3_000_000, cityCost * 3)) {
 +      add(
 +        "alert",
 +        "idlegold",
-+        `${fmt(me.gold)} gold sitting idle — that's ${Math.floor(me.gold / cityCost)} cities or ${Math.floor(me.gold / me.nextCost[UnitType.SAMLauncher])} SAMs. Spend it.`,
++        `${fmt(me.gold)} gold sitting idle — that's ${Math.floor(me.gold / cityCost)} cities or ${Math.floor(me.gold / me.nextCost[UnitType.SAMLauncher])} SAM${Math.floor(me.gold / me.nextCost[UnitType.SAMLauncher]) === 1 ? "" : "s"}. Spend it.`,
 +      );
 +    }
 +    if (me.gold >= cityCost) {
@@ -733,7 +749,7 @@ index 000000000..857fff422
 +      );
 +    }
 +    const hostileSilos = s.players.some((p) => !p.allied && p.silos > 0);
-+    const sams = me.units[UnitType.SAMLauncher] ?? 0;
++    const sams = samCount;
 +    const siloNeighbour = neighbors.find((p) => p.silos > 0);
 +    const samCost = me.nextCost[UnitType.SAMLauncher];
 +    if (
@@ -761,6 +777,17 @@ index 000000000..857fff422
 +        `Enemies have silos — first SAM (${fmt(
 +          me.nextCost[UnitType.SAMLauncher],
 +        )}) over your densest cities${me.gold >= me.nextCost[UnitType.SAMLauncher] ? " — affordable now." : "."}`,
++      );
++    } else if (
++      sams > 0 &&
++      sams < samsNeeded &&
++      hostileSilos &&
++      me.gold >= samCost
++    ) {
++      add(
++        "do",
++        "sam-more",
++        `${sams} SAM${sams > 1 ? "s" : ""} over ${me.units[UnitType.City] ?? 0} cities — add another (${fmt(samCost)}). Aim for one per three cities while anyone has silos.`,
 +      );
 +    }
 +    if (
@@ -847,6 +874,7 @@ index 000000000..857fff422
 +      if (
 +        x >= breakX &&
 +        !renewing.length &&
++        !nukeRisk(weakestAlly) &&
 +        (weakestAlly.allianceExpiresInS === null ||
 +          weakestAlly.allianceExpiresInS > 60)
 +      ) {
@@ -911,7 +939,13 @@ index 000000000..857fff422
 +        mirvTarget.smallID,
 +      );
 +    }
-+    if (me.gold >= 5_000_000 && !tips.some((t) => t.key === "mirvme")) {
++    if (
++      me.gold >= 5_000_000 &&
++      !tips.some((t) => t.key === "mirvme") &&
++      me.troopPct >= 0.3 &&
++      me.incoming.length === 0 &&
++      me.nukesIncoming.length === 0
++    ) {
 +      const rival = s.players.find((p) => !p.allied);
 +      if (rival)
 +        add(
