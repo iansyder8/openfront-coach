@@ -59,7 +59,7 @@ install() {
   apply_patch
   say "Installing dependencies (a few minutes the first time)..."
   npm run inst
-  say "Done. Run: $0 start"
+  say "Done. Run: bash $0 start"
 }
 
 update() {
@@ -96,7 +96,7 @@ pull() {
   git -C "$HERE" pull --ff-only -q
   if [ -d "${DIR}/.git" ]; then
     apply_patch
-    say "Coach updated ($(git -C "$HERE" log -1 --format='%h %s')). Run: $0 start"
+    say "Coach updated ($(git -C "$HERE" log -1 --format='%h %s')). Run: bash $0 start"
   else
     say "Pulled. Not installed yet — run: $0 install"
   fi
