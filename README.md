@@ -20,13 +20,12 @@ Troop numbers match the in-game display. The game stores them ×10 internally, a
 ## Setup (one-off, on your Mac)
 
 1. You need `git` and Node.js. If you don't have them, run `xcode-select --install`, then `brew install node`.
-2. Put `coach.sh` and `coach.patch` in the same folder, e.g. `~/Downloads/openfront-coach/`.
-3. Run:
+2. Clone this repo and install:
 
 ```bash
-cd ~/Downloads/openfront-coach
-chmod +x coach.sh
-./coach.sh install
+git clone https://github.com/iansyder8/openfront-coach.git ~/openfront-coach/kit
+cd ~/openfront-coach/kit
+bash coach.sh install
 ```
 
 The install:
@@ -36,10 +35,19 @@ The install:
 
 It takes about 5 minutes.
 
+## Getting coach updates
+
+```bash
+cd ~/openfront-coach/kit
+bash coach.sh pull
+```
+
+This pulls the latest coach from GitHub and re-applies it to your game in a few seconds, without reinstalling. If the game is running, it reloads by itself.
+
 ## Play
 
 ```bash
-./coach.sh start
+bash coach.sh start
 ```
 
 Chrome opens `http://localhost:9000`. Click **SOLO**, choose your map and difficulty, and play as normal. The coach panel appears once you spawn.
@@ -61,10 +69,10 @@ This works on any finished public or private game, after it has ended. It downlo
 2. Once the game has finished, run:
 
 ```bash
-./coach.sh review cuimG9JDdL "YourName"
+bash coach.sh review cuimG9JDdL "YourName"
 ```
 
-You can paste the whole URL instead of the ID. The script remembers your name, so next time `./coach.sh review <ID>` is enough.
+You can paste the whole URL instead of the ID. The script remembers your name, so next time `bash coach.sh review <ID>` is enough.
 
 - **First run:** it sets up a second copy of OpenFront in `~/openfront-coach/replay` (about 5 minutes).
 - **Version changes:** each game must be replayed on the exact version it was played on. When OpenFront releases a new version, the next review reinstalls for that version, which takes a few minutes.
@@ -85,7 +93,7 @@ If the name doesn't match, it lists everyone in that game so you can pick the ri
 ## Updating
 
 ```bash
-./coach.sh update
+bash coach.sh update
 ```
 
 This tries the latest OpenFront. If the patch no longer fits, it stays on the tested version.
