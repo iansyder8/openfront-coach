@@ -1,9 +1,9 @@
 diff --git a/src/client/coach/Coach.ts b/src/client/coach/Coach.ts
 new file mode 100644
-index 000000000..32bfeb5d3
+index 000000000..3abc97cd3
 --- /dev/null
 +++ b/src/client/coach/Coach.ts
-@@ -0,0 +1,1090 @@
+@@ -0,0 +1,1109 @@
 +/**
 + * OpenFront Coach — local, singleplayer-only training aid.
 + *
@@ -521,6 +521,15 @@ index 000000000..32bfeb5d3
 +    const nukeRisk = (p: PlayerSnap) => p.silos > 0 && samCount < samsNeeded;
 +
 +    // --- alerts ---
++    if (me.isTraitor) {
++      // World 4:13: broke with Chad (61K) using 4.8K, then DR Congo's boat
++      // landed on a traitor at half defence — eliminated 9s later.
++      add(
++        "alert",
++        "traitor",
++        `You broke an alliance — half defence for 30s and every AI trusts you less. Nothing else goes out; keep troops home until it clears.`,
++      );
++    }
 +    const nukeGroups = new Map<
 +      string,
 +      { from: string; type: string; n: number }
@@ -614,16 +623,21 @@ index 000000000..32bfeb5d3
 +        w.seen = s.t;
 +        this.weakSince.set(o.to, w);
 +        const age = s.t - w.since;
++        // Under a quarter of their army can't be topped up to a win — cancel
++        // straight away rather than after 30s (World 4:13: 4.8K into Chad's 61K).
++        const hopeless = o.troops < o.defenderTroops * 0.25;
 +        add(
 +          "alert",
-+          age >= 30 ? `weak-cancel:${o.to}` : `weak:${o.to}`,
-+          age >= 30
-+            ? `CANCEL your attack on ${o.to} — ${Math.round(age)}s of feeding ${fmt(o.troops)} into ${fmt(
-+                o.defenderTroops,
-+              )}. Put defence posts on that border instead.`
-+            : `Attack on ${o.to} is underpowered (${fmt(o.troops)} vs ${fmt(
-+                o.defenderTroops,
-+              )}). Top it up or cancel.`,
++          age >= 30 || hopeless ? `weak-cancel:${o.to}` : `weak:${o.to}`,
++          hopeless && age < 30
++            ? `CANCEL your attack on ${o.to} now — ${fmt(o.troops)} into ${fmt(o.defenderTroops)} is hopeless. Keep those troops home.`
++            : age >= 30
++              ? `CANCEL your attack on ${o.to} — ${Math.round(age)}s of feeding ${fmt(o.troops)} into ${fmt(
++                  o.defenderTroops,
++                )}. Put defence posts on that border instead.`
++              : `Attack on ${o.to} is underpowered (${fmt(o.troops)} vs ${fmt(
++                  o.defenderTroops,
++                )}). Top it up or cancel.`,
 +        );
 +      }
 +    }
@@ -850,7 +864,12 @@ index 000000000..32bfeb5d3
 +
 +    // early game: ally neighbouring nations, eat tribes
 +    if (s.t < 180) {
-+      for (const p of enemies.filter((p) => p.type === PlayerType.Nation)) {
++      // Two at a time, biggest first — six ask tips pushed real advice off
++      // the panel (World 0:50).
++      for (const p of enemies
++        .filter((p) => p.type === PlayerType.Nation)
++        .sort((a, b) => b.troops - a.troops)
++        .slice(0, 2)) {
 +        add(
 +          "do",
 +          `ask:${p.name}`,

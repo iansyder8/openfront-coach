@@ -38,15 +38,15 @@ with a snapshot rebuilt from the pasted log at the moment in question. Run with 
 - Win = 80% land. Breaking an alliance: −50% defence, −20% speed for 30s.
 
 ## Rules in advise() (keys)
-nuke alerts · boats · landattack · slider-danger · weak / weak-cancel (CANCEL after 30s cumulative
-feeding one target, persists across relaunches) · war:<name> (bigger neighbour attacking) ·
+traitor (you're marked traitor → keep everything home) · nuke alerts · boats · landattack · slider-danger · weak / weak-cancel (CANCEL after 30s cumulative
+feeding one target, persists across relaunches; instantly if sending < ¼ of their army) · war:<name> (bigger neighbour attacking) ·
 siege (under attack with gold banked → posts, SAM, cities) · ally:<name> renew/ignore
 (neighbouring ally ≤⅓ your size → IGNORE; any pending RENEW suppresses breaknow and stall's "break now"; nukeRisk = ally has silos and you have
 < 1 SAM per 3 cities → always RENEW, no breaknow, stall says "get N more SAMs first"; only ONE ally gets IGNORE at a time (the weakest),
 none while attacks or boats are incoming; boxed is hidden for an ally being renewed) · mirv:<name> (can afford NOW) · mirvsoon (neighbours/top-5
 only, once per nation for 60s) · empty · idle (≥80% cap, no attack) · stall (land barely moving for 60s;
 names ally in the way; "break now" at ≥3× before 8:00, ≥5× after) · idlegold · city · sam-now (red:
-no SAM, affordable, silo neighbour) / sam / sam-more (below 1 SAM per 3 cities, affordable) · port · ask:<nation> (before 3:00) · target (never a bigger
+no SAM, affordable, silo neighbour) / sam / sam-more (below 1 SAM per 3 cities, affordable) · port · ask:<nation> (before 3:00, two biggest only) · target (never a bigger
 nation attacking you) · slider-full · slider (only if ≤60% really sends 1.6× and target < your troops) ·
 wild · breaknow / boxed · slider-low · bigally · mirvme (25M + SAM cover → MIRV the rival with most cities) · hbomb (only when ≥30% troops and nothing incoming).
 idlegold fires at max(3M, 3× city cost); before 5:00 just 3× city cost.
@@ -80,3 +80,7 @@ Africa eliminated 38:40: 780K banked at 2:30 (first city 2:50); coach said IGNOR
 (11% land) then Libya + CAR nukes 15:20–17:50 (9→5 cities, 1–2 SAMs); attacked Nigeria at 20:00 → H-bomb, 7→2
 cities; collapsed to 1% at 22:10 with 4.9M unspent, then sat 15 min at 0.6% land, 100% troops, slider 100%, never
 attacking. Coach fixed: one IGNORE at a time, early idlegold, freeze on death.
+World eliminated 4:22 (55 players): crowded spawn among Türkiye/Algeria/Italy/Oman/DR Congo; attacked by Türkiye+
+Algeria at 0:48 and counter-attacked Türkiye 7.6K vs 28K; sat 86–95% cap 1:40–2:40 while land shrank; lost city to DR
+Congo 2:50; at 4:13 broke alliance with Chad sending 4.8K into 61K → traitor as DR Congo's 24.6K boat landed. Coach
+fixed: traitor alert, instant CANCEL on hopeless attacks, ask tips capped at two.
